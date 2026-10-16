@@ -197,8 +197,16 @@ def cmd_serve():
     class Demux(http.server.BaseHTTPRequestHandler):
         def _knock(self):
             path = urllib.parse.urlparse(self.path).path
+            # One queue subdirectory per service (the first path
+            # segment): each channel's consumer claims only its own
+            # service's knocks, so channels on one muse never race
+            # for the same files.
+            seg = path.strip('/').split('/')[0].lower()
+            service = ''.join(c for c in seg if c.isalnum() or c == '-') or 'misc'
+            qdir = os.path.join(QUEUE_DIR, service)
+            os.makedirs(qdir, mode=0o700, exist_ok=True)
             name = f'{time.time():.3f}-{os.getpid()}.knock'
-            with open(os.path.join(QUEUE_DIR, name), 'w') as f:
+            with open(os.path.join(qdir, name), 'w') as f:
                 f.write(f'{self.command} {path}\n')
             body = b'ok\n'
             self.send_response(200)
