@@ -15,11 +15,12 @@ Code: `kw-web.py` (the service), `kw-authkeys.py` (sshd helper),
 | `POST /v1/register` | In: `{guid, cert, nonce, signature}` → `201` (new) / `200` (re-register) `{port, guid_hash, lease_expires}`. Verifies, in order: certmint trust anchors fetchable (`502`) → cert parses → mint signature against certmint's published key → is a guid cert → serial not in certmint `/revoked` (`403`) → cert unexpired (`403`) → `hash(guid) == guid-hash:` (`400`) → challenge live and serial-matched (`400`) → possession signature (`403`) |
 
 On success, under one lock: a live lease for the hash returns its
-**same port** (latest verified cert/key wins the record — a peer
-takeover); a lapsed record re-adopts its port; a new hash gets the
-first pool port that is neither under a live lease, nor **actually
-bound** (read from the kernel listener tables), nor inside its
-post-collection rest window.
+**same port** (the record is refreshed to the newest cert — a
+renewed peer simply takes over its own lease); a lapsed record
+re-adopts its port; a new hash gets the first pool port that is
+neither under a live lease, nor **actually bound** (read from the
+kernel listener tables), nor inside its post-collection rest
+window.
 
 ## Connection plane — sshd
 
