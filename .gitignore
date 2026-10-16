@@ -1,0 +1,14 @@
+# deployment config and secrets — never commit
+*.env
+.tokens
+*.pem
+*.key
+
+# runtime state and issued material
+state.json
+registration.json
+guid.txt
+ssh_key
+queue/
+__pycache__/
+*.log
