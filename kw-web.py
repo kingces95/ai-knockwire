@@ -421,7 +421,7 @@ class H(http.server.BaseHTTPRequestHandler):
         if path == '/v1/register' and self.command == 'POST':
             self._register()
             return
-        if host in ('push.knockwire.ai', 'push.knockwire.net'):
+        if host == 'push.knockwire.net':
             # A knock is /<guid>/<service...>: deliver path-only, or
             # drop. Non-knock paths keep the doorbell stub.
             parts = path.split('/', 2)
