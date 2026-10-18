@@ -5,7 +5,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 CONFIG_PATH = '/etc/knockwire/meta.env'
 GRAPH_VERSION = 'v23.0'
-REDIRECT_URI = 'https://knockwire.ai/auth/meta/callback'
+REDIRECT_URI = 'https://knockwire.net/auth/meta/callback'
 
 # ---------- guid registration (design: guid-hash-cert-design) ----------
 # All knobs are env-overridable so the test harness can run the same
