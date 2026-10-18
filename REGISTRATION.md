@@ -41,7 +41,7 @@ window.
   the port simply cannot bind until the first leaves. Expiry is the
   only executioner (see reapers).
 
-## Knock plane — push.knockwire.ai
+## Knock plane — push.knockwire.net
 
 `POST /<guid>/<service...>` (any method): knockwire hashes the guid,
 looks up the live registration, and delivers a **rebuilt** request to
