@@ -23,7 +23,7 @@ is rewritten once into OpenSSH format at ~/.knockwire/ssh_key
 import base64, hashlib, json, os, struct, subprocess, sys, time
 import http.server, urllib.parse
 
-KW_BASE = os.environ.get('KW_BASE', 'https://www.knockwire.net')
+KW_BASE = os.environ.get('KW_BASE', 'https://knockwire.net')
 KW_SSH_TARGET = os.environ.get('KW_SSH_TARGET', 'kw@knockwire.local')
 KW_SSH_PORT = os.environ.get('KW_SSH_PORT', '')
 DEMUX_PORT = int(os.environ.get('KW_DEMUX_PORT', '18765'))
