@@ -1,11 +1,6 @@
 import http.server, datetime, os, secrets, urllib.parse, urllib.request, json
 import base64, hashlib, struct, threading, time, signal
-from http.cookies import SimpleCookie
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-
-CONFIG_PATH = '/etc/knockwire/meta.env'
-GRAPH_VERSION = 'v23.0'
-REDIRECT_URI = 'https://knockwire.net/auth/meta/callback'
 
 # ---------- guid registration (design: guid-hash-cert-design) ----------
 # All knobs are env-overridable so the test harness can run the same
@@ -179,20 +174,6 @@ def reaper():
         except Exception:
             continue
 
-def load_config():
-    cfg = {}
-    try:
-        with open(CONFIG_PATH) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    k, v = line.split('=', 1)
-                    cfg[k.strip()] = v.strip()
-    except FileNotFoundError:
-        pass
-    return cfg
-
-SESSIONS = {}  # session_token -> {'id':..., 'name':..., 'email':...}
 
 CSS = "body{font-family:system-ui,sans-serif;margin:4rem auto;max-width:40rem;padding:0 1rem}h1{font-weight:600}p{color:#555}.btn{display:inline-block;background:#0081fb;color:#fff;padding:.7rem 1.4rem;border-radius:.5rem;text-decoration:none;font-weight:600}code{background:#f0f0f0;padding:.15rem .4rem;border-radius:.3rem}"
 
@@ -390,25 +371,6 @@ class H(http.server.BaseHTTPRequestHandler):
         if self.command != 'HEAD':
             self.wfile.write(body)
 
-    def _redirect(self, location, extra=None):
-        self.send_response(302)
-        self.send_header('Location', location)
-        self.send_header('Content-Length', '0')
-        for k, v in (extra or []):
-            self.send_header(k, v)
-        self.end_headers()
-
-    def _cookies(self):
-        c = SimpleCookie()
-        raw = self.headers.get('Cookie')
-        if raw:
-            c.load(raw)
-        return {k: morsel.value for k, morsel in c.items()}
-
-    def _session_user(self):
-        tok = self._cookies().get('kw_session')
-        return SESSIONS.get(tok) if tok else None
-
     def _route(self):
         ts = self._log()
         host = (self.headers.get('Host') or '').split(':')[0].lower()
@@ -432,87 +394,10 @@ class H(http.server.BaseHTTPRequestHandler):
                 return
             self._send(200, f'knockwire hit {ts}\n'.encode(), 'text/plain')
             return
-        cfg = load_config()
-        app_id = cfg.get('META_APP_ID', '')
-        app_secret = cfg.get('META_APP_SECRET', '')
-
         if path in ('/', '/index.html'):
-            user = self._session_user()
-            if user:
-                email_line = f"<p>email: <code>{user.get('email') or '(not granted)'}</code></p>" if 'email' in user else ''
-                name_line = f"<p>name: <code>{user.get('name') or '(unknown)'}</code></p>" if user.get('name') else ''
-                inner = f"""<h1>knockwire</h1>
-<p>You are signed in with Meta.</p>
-<p>Your Meta ID: <code>{user['id']}</code></p>
-{name_line}{email_line}
-<p><a href="/logout">Sign out</a></p>"""
-                self._send(200, page('knockwire', inner))
-            elif app_id:
-                inner = """<h1>knockwire</h1>
-<p>Sign in to continue.</p>
-<p><a class="btn" href="/auth/meta">Continue with Meta</a></p>"""
-                self._send(200, page('knockwire', inner))
-            else:
-                inner = """<h1>knockwire</h1>
-<p>Meta login is not configured yet.</p>"""
-                self._send(200, page('knockwire', inner))
-            return
-
-        if path == '/auth/meta':
-            if not app_id:
-                self._send(503, page('knockwire', '<h1>knockwire</h1><p>Meta login is not configured yet.</p>'))
-                return
-            state = secrets.token_urlsafe(24)
-            params = urllib.parse.urlencode({
-                'client_id': app_id,
-                'redirect_uri': REDIRECT_URI,
-                'state': state,
-                'response_type': 'code',
-                'scope': 'public_profile',
-            })
-            cookie = f'kw_state={state}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=600'
-            self._redirect(f'https://www.facebook.com/{GRAPH_VERSION}/dialog/oauth?{params}',
-                           [('Set-Cookie', cookie)])
-            return
-
-        if path == '/auth/meta/callback':
-            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            if 'error' in qs:
-                self._send(400, page('knockwire', f"<h1>knockwire</h1><p>Meta login was declined or failed: {qs.get('error_description', qs['error'])[0]}</p><p><a href=\"/\">Back</a></p>"))
-                return
-            code = (qs.get('code') or [''])[0]
-            state = (qs.get('state') or [''])[0]
-            if not code or not state or state != self._cookies().get('kw_state'):
-                self._send(400, page('knockwire', '<h1>knockwire</h1><p>Invalid login callback (state check failed).</p><p><a href="/">Back</a></p>'))
-                return
-            try:
-                token_params = urllib.parse.urlencode({
-                    'client_id': app_id,
-                    'client_secret': app_secret,
-                    'redirect_uri': REDIRECT_URI,
-                    'code': code,
-                })
-                with urllib.request.urlopen(f'https://graph.facebook.com/{GRAPH_VERSION}/oauth/access_token?{token_params}', timeout=15) as r:
-                    token = json.load(r)['access_token']
-                me_params = urllib.parse.urlencode({'fields': 'id,name', 'access_token': token})
-                with urllib.request.urlopen(f'https://graph.facebook.com/{GRAPH_VERSION}/me?{me_params}', timeout=15) as r:
-                    me = json.load(r)
-            except Exception as e:
-                self._send(502, page('knockwire', f'<h1>knockwire</h1><p>Could not complete Meta login: {type(e).__name__}</p><p><a href="/">Back</a></p>'))
-                return
-            tok = secrets.token_urlsafe(32)
-            SESSIONS[tok] = {'id': me['id'], 'name': me.get('name')}
-            cookie = f'kw_session={tok}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=86400'
-            clear_state = 'kw_state=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0'
-            self._redirect('/', [('Set-Cookie', cookie), ('Set-Cookie', clear_state)])
-            return
-
-        if path == '/logout':
-            tok = self._cookies().get('kw_session')
-            if tok:
-                SESSIONS.pop(tok, None)
-            clear = 'kw_session=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0'
-            self._redirect('/', [('Set-Cookie', clear)])
+            inner = """<h1>knockwire</h1>
+<p>knockwire is listening.</p>"""
+            self._send(200, page('knockwire', inner))
             return
 
         self._send(404, b'not found\n', 'text/plain')
