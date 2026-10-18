@@ -17,7 +17,7 @@ the next successful fetch.
 import json, os, sys, time, urllib.request
 
 STATE_PATH = os.environ.get('KW_STATE_PATH', '/var/lib/knockwire/state.json')
-CERTMINT_BASE = os.environ.get('KW_CERTMINT_BASE', 'https://certmint.net')
+CERTMINT_BASE = os.environ.get('KW_CERTMINT_BASE', 'https://www.certmint.net')
 REVOKED_CACHE = os.environ.get('KW_REVOKED_CACHE', '/var/lib/knockwire/revoked.cache')
 REVOKED_TTL_SECS = int(os.environ.get('KW_REVOKED_TTL_SECS', '300'))
 

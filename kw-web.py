@@ -12,7 +12,7 @@ REDIRECT_URI = 'https://knockwire.ai/auth/meta/callback'
 # code with short clocks and scratch paths.
 STATE_PATH = os.environ.get('KW_STATE_PATH', '/var/lib/knockwire/state.json')
 LOG_PATH = os.environ.get('KW_LOG_PATH', '/var/log/kw-test.log')
-CERTMINT_BASE = os.environ.get('KW_CERTMINT_BASE', 'https://certmint.net')
+CERTMINT_BASE = os.environ.get('KW_CERTMINT_BASE', 'https://www.certmint.net')
 PORT_POOL_START = int(os.environ.get('KW_PORT_START', '20000'))
 PORT_POOL_END = int(os.environ.get('KW_PORT_END', '20999'))
 LEASE_TTL_SECS = int(os.environ.get('KW_LEASE_TTL_SECS', str(24 * 3600)))
