@@ -70,3 +70,13 @@ positives and negatives, allocation, lease cull, port collection),
 plus staged live probes of the sshd plane — authorization,
 forward binding, path-only delivery, and revocation enforced at
 connection time.
+
+Mailbox (2026-10-23): a knock for a REGISTERED guid whose delivery
+attempt fails is spooled to a per-guid mailbox in the server state
+and retried FIFO by a flusher thread until it lands, ages past
+KW_MAILBOX_TTL_SECS (default 24h), or the registration is culled.
+Overflow past KW_MAILBOX_MAX (default 500) drops the oldest entry.
+Unregistered/lapsed guids still drop, never queue. The sender sees
+"knockwire queued" for a spooled knock. Per-guid counters
+(spooled/delivered/expired/overflow) live in mailbox_stats.
+Knocks are pointers, so at-least-once delivery is safe downstream.

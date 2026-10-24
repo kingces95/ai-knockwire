@@ -14,6 +14,9 @@ LEASE_TTL_SECS = int(os.environ.get('KW_LEASE_TTL_SECS', str(24 * 3600)))
 PORT_COLLECT_SECS = int(os.environ.get('KW_PORT_COLLECT_SECS', str(24 * 3600)))
 CHALLENGE_TTL_SECS = int(os.environ.get('KW_CHALLENGE_TTL_SECS', '300'))
 CULL_INTERVAL_SECS = int(os.environ.get('KW_CULL_INTERVAL_SECS', '60'))
+MAILBOX_FLUSH_SECS = int(os.environ.get('KW_MAILBOX_FLUSH_SECS', '15'))
+MAILBOX_TTL_SECS = int(os.environ.get('KW_MAILBOX_TTL_SECS', str(24 * 3600)))
+MAILBOX_MAX = int(os.environ.get('KW_MAILBOX_MAX', '500'))
 TRUST_TTL_SECS = int(os.environ.get('KW_TRUST_TTL_SECS', '300'))
 LISTEN_PORT = int(os.environ.get('KW_PORT', '18080'))
 
@@ -32,7 +35,8 @@ def load_state():
         with open(STATE_PATH) as f:
             return json.load(f)
     except Exception:
-        return {'registrations': {}, 'challenges': {}, 'ports': {}}
+        return {'registrations': {}, 'challenges': {}, 'ports': {},
+                'mailboxes': {}, 'mailbox_stats': {}}
 
 def save_state(st):
     tmp = STATE_PATH + '.tmp'
@@ -145,6 +149,98 @@ def kill_port(port):
         except OSError:
             continue
 
+# ---------- mailbox: store-and-forward for registered knocks ----------
+# A knock for a registered guid whose delivery attempt fails (tunnel
+# down, client demux not answering) is spooled per-guid and retried by
+# the flusher until it lands, the entry ages past MAILBOX_TTL_SECS, or
+# the registration is culled. Unregistered/lapsed guids still drop —
+# the mailbox never queues for strangers. Knocks are pointers: a late
+# or duplicate delivery is harmless downstream (pulls are range-based),
+# so delivery here is at-least-once.
+
+def try_deliver(port, method, rest):
+    """One path-only delivery attempt to the bound port. True iff the
+    client's endpoint answered without a transport/HTTP error."""
+    url = f'http://127.0.0.1:{port}{rest}'
+    relay = urllib.request.Request(url, data=None, method=method)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(relay, timeout=5) as r:
+            r.read()
+        return True
+    except Exception:
+        return False
+
+def _stats(st, guid_hash):
+    return st.setdefault('mailbox_stats', {}).setdefault(
+        guid_hash, {'spooled': 0, 'delivered': 0, 'expired': 0, 'overflow': 0})
+
+def spool_knock(guid_hash, method, rest):
+    """Append a failed knock to the guid's mailbox (LOCK held by caller
+    discipline: this takes LOCK itself). Overflow drops the OLDEST
+    entry — a newer knock's pull subsumes it."""
+    with LOCK:
+        st = load_state()
+        box = st.setdefault('mailboxes', {}).setdefault(guid_hash, [])
+        box.append({'m': method, 'p': rest, 'q': ts(now_utc()), 'n': 0})
+        stats = _stats(st, guid_hash)
+        stats['spooled'] += 1
+        while len(box) > MAILBOX_MAX:
+            box.pop(0)
+            stats['overflow'] += 1
+        save_state(st)
+
+def mailbox_flush():
+    """Every MAILBOX_FLUSH_SECS: expire old entries, and for each
+    mailbox whose port is currently bound, deliver FIFO until the
+    first failure. Delivery attempts run outside LOCK; a successful
+    head is popped only if it is still the head."""
+    while True:
+        time.sleep(MAILBOX_FLUSH_SECS)
+        try:
+            bound = bound_ports()
+            with LOCK:
+                st = load_state()
+            for guid_hash, box in list(st.get('mailboxes', {}).items()):
+                if not box:
+                    continue
+                reg = st['registrations'].get(guid_hash)
+                if not reg or parse_ts(reg['lease_expires']) < now_utc():
+                    continue  # reaper owns teardown of dead registrations
+                port = reg['port']
+                cutoff = now_utc() - datetime.timedelta(seconds=MAILBOX_TTL_SECS)
+                while box and parse_ts(box[0]['q']) < cutoff:
+                    head = box.pop(0)
+                    with LOCK:
+                        st2 = load_state()
+                        live = st2.get('mailboxes', {}).get(guid_hash, [])
+                        if live and live[0] == head:
+                            live.pop(0)
+                            _stats(st2, guid_hash)['expired'] += 1
+                            save_state(st2)
+                if port not in bound:
+                    continue
+                while box:
+                    head = box[0]
+                    if not try_deliver(port, head['m'], head['p']):
+                        with LOCK:
+                            st2 = load_state()
+                            live = st2.get('mailboxes', {}).get(guid_hash, [])
+                            if live and live[0]['q'] == head['q'] and live[0]['p'] == head['p']:
+                                live[0]['n'] = live[0].get('n', 0) + 1
+                                save_state(st2)
+                        break
+                    with LOCK:
+                        st2 = load_state()
+                        live = st2.get('mailboxes', {}).get(guid_hash, [])
+                        if live and live[0]['q'] == head['q'] and live[0]['p'] == head['p']:
+                            live.pop(0)
+                            _stats(st2, guid_hash)['delivered'] += 1
+                            save_state(st2)
+                    box = box[1:]
+        except Exception:
+            continue
+
 def reaper():
     """Every CULL_INTERVAL_SECS: refresh last-bound sightings, and
     tear down expired leases IN REVERSE — kill the connection, then
@@ -166,6 +262,7 @@ def reaper():
                     if parse_ts(reg['lease_expires']) < now_utc():
                         kills.append(port)
                         del st['registrations'][h]
+                        st.get('mailboxes', {}).pop(h, None)
                         changed = True
                 if changed:
                     save_state(st)
@@ -350,16 +447,13 @@ class H(http.server.BaseHTTPRequestHandler):
             return
         # The delivered request is rebuilt from the path alone: no
         # body, no query, no fragment, no sender headers. Loopback is
-        # never proxied.
-        url = f'http://127.0.0.1:{port}{rest}'
-        relay = urllib.request.Request(url, data=None, method=self.command)
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        try:
-            with opener.open(relay, timeout=5) as r:
-                r.read()
+        # never proxied. A failed delivery to a REGISTERED guid is
+        # spooled to its mailbox for the flusher, not dropped.
+        if try_deliver(port, self.command, rest):
             self._send(200, b'knockwire knock\n', 'text/plain')
-        except Exception:
-            self._send(200, b'knockwire drop\n', 'text/plain')
+        else:
+            spool_knock(guid_hash, self.command, rest)
+            self._send(200, b'knockwire queued\n', 'text/plain')
 
     def _send(self, code, body, ctype='text/html; charset=utf-8', extra=None):
         self.send_response(code)
@@ -407,4 +501,5 @@ class H(http.server.BaseHTTPRequestHandler):
     do_HEAD = _route
 
 threading.Thread(target=reaper, daemon=True).start()
+threading.Thread(target=mailbox_flush, daemon=True).start()
 http.server.ThreadingHTTPServer(('127.0.0.1', LISTEN_PORT), H).serve_forever()
