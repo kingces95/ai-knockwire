@@ -17,6 +17,15 @@ CULL_INTERVAL_SECS = int(os.environ.get('KW_CULL_INTERVAL_SECS', '60'))
 MAILBOX_FLUSH_SECS = int(os.environ.get('KW_MAILBOX_FLUSH_SECS', '15'))
 MAILBOX_TTL_SECS = int(os.environ.get('KW_MAILBOX_TTL_SECS', str(24 * 3600)))
 MAILBOX_MAX = int(os.environ.get('KW_MAILBOX_MAX', '500'))
+# Certwire app-layer delivery (2026-10-23): registrations that carry a
+# certwire address get knocks for these services delivered as app-layer
+# posts via the kw-bridge companion (the ack is the delivery signal);
+# everything else — and any certwire failure — falls back to the bound
+# tunnel port. The mailbox flush uses the same deliver() path.
+BRIDGE_URL = os.environ.get('KW_BRIDGE_URL', 'http://127.0.0.1:18770')
+CW_SERVICES = {s.strip() for s in os.environ.get(
+    'KW_CERTWIRE_SERVICES', 'gmail,gmailwork,test').split(',') if s.strip()}
+DELIVER_LOG = os.environ.get('KW_DELIVER_LOG', '/var/log/kw-deliver.log')
 TRUST_TTL_SECS = int(os.environ.get('KW_TRUST_TTL_SECS', '300'))
 LISTEN_PORT = int(os.environ.get('KW_PORT', '18080'))
 
@@ -171,18 +180,61 @@ def try_deliver(port, method, rest):
     except Exception:
         return False
 
+def _dlog(msg):
+    try:
+        with open(DELIVER_LOG, 'a') as f:
+            f.write(f'{ts(now_utc())} {msg}\n')
+    except Exception:
+        pass
+
+def bridge_deliver(addr, guid_hex, method, rest):
+    """One app-layer delivery attempt via kw-bridge. True iff the
+    muse acked 200 — the ack, not the router's 'sent', is the
+    delivery signal (a bound-but-deaf endpoint must not count)."""
+    data = json.dumps({'to': addr, 'path': f'/{guid_hex}{rest}',
+                       'method': method}).encode()
+    relay = urllib.request.Request(BRIDGE_URL + '/deliver', data=data,
+        method='POST', headers={'Content-Type': 'application/json'})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(relay, timeout=15) as r:
+            return json.loads(r.read() or b'{}').get('status') == 200
+    except Exception:
+        return False
+
+def deliver(reg, guid_hex, method, rest):
+    """Deliver one knock for a registration: certwire app-layer for
+    opted-in services on registrations carrying a certwire address,
+    the bound tunnel port otherwise (and as fallback). Mailbox
+    entries spooled before guid_hex was recorded pass None and stay
+    port-only."""
+    service = rest.strip('/').split('/')[0].lower() if rest.strip('/') else ''
+    addr = reg.get('certwire')
+    if addr and guid_hex and service in CW_SERVICES:
+        if bridge_deliver(addr, guid_hex, method, rest):
+            _dlog(f'certwire ok {method} {rest} -> {addr}')
+            return True
+        _dlog(f'certwire failed {method} {rest} -> {addr}; trying port')
+    ok = try_deliver(reg['port'], method, rest)
+    _dlog(f"port {'ok' if ok else 'failed'} {method} {rest} -> {reg['port']}")
+    return ok
+
 def _stats(st, guid_hash):
     return st.setdefault('mailbox_stats', {}).setdefault(
         guid_hash, {'spooled': 0, 'delivered': 0, 'expired': 0, 'overflow': 0})
 
-def spool_knock(guid_hash, method, rest):
+def spool_knock(guid_hash, guid_hex, method, rest):
     """Append a failed knock to the guid's mailbox (LOCK held by caller
     discipline: this takes LOCK itself). Overflow drops the OLDEST
-    entry — a newer knock's pull subsumes it."""
+    entry — a newer knock's pull subsumes it. guid_hex rides along so
+    the flusher can rebuild the certwire app path (/<guid>/<service>);
+    entries spooled before it was recorded lack 'g' and stay
+    port-only."""
     with LOCK:
         st = load_state()
         box = st.setdefault('mailboxes', {}).setdefault(guid_hash, [])
-        box.append({'m': method, 'p': rest, 'q': ts(now_utc()), 'n': 0})
+        box.append({'m': method, 'p': rest, 'g': guid_hex,
+                    'q': ts(now_utc()), 'n': 0})
         stats = _stats(st, guid_hash)
         stats['spooled'] += 1
         while len(box) > MAILBOX_MAX:
@@ -218,11 +270,11 @@ def mailbox_flush():
                             live.pop(0)
                             _stats(st2, guid_hash)['expired'] += 1
                             save_state(st2)
-                if port not in bound:
+                if port not in bound and not reg.get('certwire'):
                     continue
                 while box:
                     head = box[0]
-                    if not try_deliver(port, head['m'], head['p']):
+                    if not deliver(reg, head.get('g'), head['m'], head['p']):
                         with LOCK:
                             st2 = load_state()
                             live = st2.get('mailboxes', {}).get(guid_hash, [])
@@ -332,6 +384,10 @@ class H(http.server.BaseHTTPRequestHandler):
         nonce = req.get('nonce') or ''
         sig_b64 = req.get('signature') or ''
         guid_hex = (req.get('guid') or '').strip().lower()
+        cw_addr = (req.get('certwire') or '').strip()
+        if cw_addr and ('/' not in cw_addr or ' ' in cw_addr
+                         or len(cw_addr) > 128):
+            cw_addr = ''
         try:
             mint_raw, revoked = trust()
         except Exception:
@@ -400,6 +456,8 @@ class H(http.server.BaseHTTPRequestHandler):
                                  'key-fingerprint': fields['key-fingerprint'],
                                  'serial': int(serial),
                                  'lease_expires': lease_exp})
+                if cw_addr:
+                    existing['certwire'] = cw_addr
                 st['ports'][str(port)] = {'last_used': ts(now_utc())}
                 save_state(st)
                 self._json(200, {'port': port, 'guid_hash': guid_hash,
@@ -424,6 +482,8 @@ class H(http.server.BaseHTTPRequestHandler):
                 'key-fingerprint': fields['key-fingerprint'],
                 'serial': int(serial), 'lease_expires': lease_exp,
                 'last_bound': None}
+            if cw_addr:
+                st['registrations'][guid_hash]['certwire'] = cw_addr
             st['ports'][str(port)] = {'last_used': ts(now_utc())}
             save_state(st)
         self._json(201, {'port': port, 'guid_hash': guid_hash,
@@ -435,24 +495,24 @@ class H(http.server.BaseHTTPRequestHandler):
             guid_hash = guid_hash_of(bytes.fromhex(guid_hex))
         except Exception:
             guid_hash = None
-        port = None
+        reg = None
         if guid_hash:
             with LOCK:
                 st = load_state()
-            reg = st['registrations'].get(guid_hash)
-            if reg and parse_ts(reg['lease_expires']) >= now_utc():
-                port = reg['port']
-        if port is None:
+            r = st['registrations'].get(guid_hash)
+            if r and parse_ts(r['lease_expires']) >= now_utc():
+                reg = r
+        if reg is None:
             self._send(200, b'knockwire drop\n', 'text/plain')
             return
         # The delivered request is rebuilt from the path alone: no
         # body, no query, no fragment, no sender headers. Loopback is
         # never proxied. A failed delivery to a REGISTERED guid is
         # spooled to its mailbox for the flusher, not dropped.
-        if try_deliver(port, self.command, rest):
+        if deliver(reg, guid_hex, self.command, rest):
             self._send(200, b'knockwire knock\n', 'text/plain')
         else:
-            spool_knock(guid_hash, self.command, rest)
+            spool_knock(guid_hash, guid_hex, self.command, rest)
             self._send(200, b'knockwire queued\n', 'text/plain')
 
     def _send(self, code, body, ctype='text/html; charset=utf-8', extra=None):

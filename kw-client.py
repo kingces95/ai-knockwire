@@ -3,7 +3,7 @@
 
 Usage:
   kw-client.py register   # register the held guid cert; print the port
-  kw-client.py connect    # open the long SSH connection on that port
+  kw-client.py connect    # hold the long SSH connection (supervised loop)
   kw-client.py serve      # demux listener: record knocks (path only)
   kw-client.py show       # print the current registration
 
@@ -20,8 +20,8 @@ sign with ssh's format either. So connect converts: the PKCS#8 key
 is rewritten once into OpenSSH format at ~/.knockwire/ssh_key
 (pure-stdlib conversion, same key material, fingerprint unchanged).
 """
-import base64, hashlib, json, os, struct, subprocess, sys, time
-import http.server, urllib.parse
+import base64, hashlib, json, os, signal, struct, subprocess, sys, time
+import datetime, http.server, urllib.parse
 
 KW_BASE = os.environ.get('KW_BASE', 'https://knockwire.net')
 KW_SSH_TARGET = os.environ.get('KW_SSH_TARGET', 'kw@knockwire.local')
@@ -156,7 +156,18 @@ def ssh_key_path():
     os.chmod(SSH_KEY_FILE, 0o600)
     return SSH_KEY_FILE
 
-def cmd_register():
+def my_certwire_address():
+    """This muse's certwire address (issuer/serial of its id cert),
+    advertised at registration so knockwire can deliver knocks as
+    app-layer posts over certwire as well as via the tunnel port."""
+    try:
+        text = open(os.path.join(CM_DIR, 'cert.txt')).read()
+        f = parse_cert(text)
+        return f"{f['issuer'][0]}/{f['serial'][0]}"
+    except Exception:
+        return None
+
+def do_register():
     guid = open(GUID_FILE).read().strip()
     found = my_guid_cert()
     assert found, 'no held guid cert bound to the certmint key'
@@ -164,32 +175,137 @@ def cmd_register():
     code, ch = req('GET', f'{KW_BASE}/v1/register/challenge?serial={serial}')
     assert code == 200, f'challenge failed: {code} {ch}'
     sig = sign_with(CM_KEY, ch['signing_string'].encode())
-    code, obj = req('POST', f'{KW_BASE}/v1/register',
-                    {'guid': guid, 'cert': cert,
-                     'nonce': ch['nonce'], 'signature': sig})
+    body = {'guid': guid, 'cert': cert,
+            'nonce': ch['nonce'], 'signature': sig}
+    cw_addr = my_certwire_address()
+    if cw_addr:
+        body['certwire'] = cw_addr
+    code, obj = req('POST', f'{KW_BASE}/v1/register', body)
     assert code in (200, 201), f'register failed: {code} {obj}'
     os.makedirs(KW_DIR, mode=0o700, exist_ok=True)
     json.dump(obj, open(REG_FILE, 'w'))
+    return obj
+
+def cmd_register():
+    obj = do_register()
     print('port:', obj['port'])
     print('lease expires:', obj['lease_expires'])
 
+def _log(msg):
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    print(f'{ts} connect: {msg}', flush=True)
+
+def _lease_stale(reg):
+    """True when the registration is missing its port or its lease
+    expires within the hour (the connect loop re-registers then;
+    registering while a lease is alive returns the same port)."""
+    if not reg or not reg.get('port'):
+        return True
+    try:
+        exp = datetime.datetime.fromisoformat(
+            reg['lease_expires'].replace('Z', '+00:00'))
+    except Exception:
+        return True
+    return (exp - datetime.datetime.now(datetime.timezone.utc)
+            < datetime.timedelta(hours=1))
+
+def _sweep_orphan_ssh(port):
+    """Kill any ssh already holding our exact forward. At supervisor
+    start such a process can only be an orphan of a previous
+    supervisor incarnation (or a wrong-transport dial): either way
+    the new supervisor must start from a clean slate."""
+    want = f'{port}:127.0.0.1:{DEMUX_PORT}'
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit() or int(pid) == os.getpid():
+            continue
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                argv = f.read().split(b'\0')
+        except OSError:
+            continue
+        if argv and argv[0].endswith(b'ssh') and want.encode() in argv:
+            _log(f'killing orphan ssh pid {pid} holding -R {want}')
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except OSError:
+                pass
+
 def cmd_connect():
-    reg = json.load(open(REG_FILE))
-    port = reg['port']
-    args = ['ssh', '-N', '-T',
-            '-o', 'ExitOnForwardFailure=yes',
-            '-o', 'ServerAliveInterval=30',
-            '-o', 'ServerAliveCountMax=3',
-            '-o', 'IdentitiesOnly=yes',
-            '-i', ssh_key_path()]
-    if KW_SSH_PORT:
-        args += ['-p', KW_SSH_PORT]
-    # No explicit bind address: sshd records the forward as
-    # "localhost", which is what the authorized line's
-    # permitlisten="localhost:<port>" matches.
-    args += ['-R', f'{port}:127.0.0.1:{DEMUX_PORT}', KW_SSH_TARGET]
-    print('connecting:', ' '.join(args), flush=True)
-    os.execvp('ssh', args)
+    """Supervised connect: hold the SSH forward, and when ssh exits
+    (the Cloudflare-proxied path severs tunnels at random ages —
+    both ends log an abrupt EOF and nothing else notices), refresh
+    the lease if it is near expiry and relaunch, with backoff.
+    Before 2026-10-23 this exec'd ssh once and the forward stayed
+    dead until the restart sentinel or the 12h lease check revived
+    it; that discovery gap is what this loop closes."""
+    try:
+        reg = json.load(open(REG_FILE))
+    except Exception:
+        reg = None
+    if _lease_stale(reg):
+        try:
+            reg = do_register()
+            _log(f'registered: port {reg["port"]}, '
+                 f'lease expires {reg["lease_expires"]}')
+        except Exception as e:
+            _log(f'register failed ({e}); continuing with on-file state')
+            if reg is None:
+                raise
+    _sweep_orphan_ssh(reg['port'])
+
+    child = {'proc': None}
+
+    def _stop(signum, frame):
+        if child['proc'] is not None:
+            child['proc'].terminate()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
+
+    backoff = 5
+    while True:
+        try:
+            reg = json.load(open(REG_FILE))
+        except Exception:
+            reg = None
+        if _lease_stale(reg):
+            try:
+                reg = do_register()
+                _log(f're-registered: port {reg["port"]}, '
+                     f'lease expires {reg["lease_expires"]}')
+            except Exception as e:
+                _log(f're-register failed ({e}); relaunching on old state')
+                if reg is None:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+                    continue
+        port = reg['port']
+        args = ['ssh', '-N', '-T',
+                '-o', 'ExitOnForwardFailure=yes',
+                '-o', 'ServerAliveInterval=30',
+                '-o', 'ServerAliveCountMax=3',
+                '-o', 'IdentitiesOnly=yes',
+                '-i', ssh_key_path()]
+        if KW_SSH_PORT:
+            args += ['-p', KW_SSH_PORT]
+        # No explicit bind address: sshd records the forward as
+        # "localhost", which is what the authorized line's
+        # permitlisten="localhost:<port>" matches.
+        args += ['-R', f'{port}:127.0.0.1:{DEMUX_PORT}', KW_SSH_TARGET]
+        _log('connecting: ' + ' '.join(args))
+        started = time.time()
+        child['proc'] = subprocess.Popen(args)
+        rc = child['proc'].wait()
+        child['proc'] = None
+        lived = time.time() - started
+        if lived >= 300:
+            backoff = 5
+        _log(f'ssh exited rc={rc} after {lived:.0f}s; '
+             f'relaunching in {backoff}s')
+        time.sleep(backoff)
+        if lived < 300:
+            backoff = min(backoff * 2, 60)
 
 def cmd_serve():
     os.makedirs(QUEUE_DIR, mode=0o700, exist_ok=True)

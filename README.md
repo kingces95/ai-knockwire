@@ -71,6 +71,19 @@ plus staged live probes of the sshd plane — authorization,
 forward binding, path-only delivery, and revocation enforced at
 connection time.
 
+Certwire delivery (2026-10-23): a registration may carry the muse's
+certwire address (kw-client advertises it at registration from its
+id cert). For opted-in services (KW_CERTWIRE_SERVICES, default
+gmail,gmailwork,test) kw-web's deliver() first posts the knock as a
+certwire app-layer frame via the kw-bridge companion (which holds
+knockwire's domain-cert connection, certmint.net/25) and counts it
+delivered only on the muse's ack; the bound tunnel port is the
+fallback, and the mailbox flusher uses the same deliver() path.
+Knockwire thus becomes an edge service on the certwire fabric: it
+keeps the GUID map and the payload-stripping contract, and asserts
+both by sending from its own cert. See net-certwire's
+APP-PROTOCOL.md.
+
 Mailbox (2026-10-23): a knock for a REGISTERED guid whose delivery
 attempt fails is spooled to a per-guid mailbox in the server state
 and retried FIFO by a flusher thread until it lands, ages past
