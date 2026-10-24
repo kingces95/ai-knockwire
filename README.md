@@ -82,7 +82,9 @@ fallback, and the mailbox flusher uses the same deliver() path.
 Knockwire thus becomes an edge service on the certwire fabric: it
 keeps the GUID map and the payload-stripping contract, and asserts
 both by sending from its own cert. See net-certwire's
-APP-PROTOCOL.md.
+APP-PROTOCOL.md — its Bootstrap section collects the endpoints,
+the fetchable provisor cert, and the daemon config an adopter
+needs.
 
 Mailbox (2026-10-23): a knock for a REGISTERED guid whose delivery
 attempt fails is spooled to a per-guid mailbox in the server state
